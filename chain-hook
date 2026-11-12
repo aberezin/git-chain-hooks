@@ -1,0 +1,111 @@
+#!/bin/sh
+# chain-hook — one dispatcher for every git hook.
+#
+# Installed as core.hooksPath/<hook-name> (a symlink per hook name), it runs:
+#   1. the global implementation, <chain-dir>/global.d/<hook-name>
+#   2. the repository's own hooks:  <repo>/.git/hooks/<hook-name>
+#                              and <repo>/.git/hooks/<hook-name>.d/*  (sorted)
+#
+# WHY: a global core.hooksPath REPLACES .git/hooks — git never looks there — so
+# every repo-local hook silently stops running. This puts them back.
+#
+# Notes on the things other chainers get wrong:
+#  * The repo's hook dir is `git rev-parse --git-common-dir`/hooks. NOT
+#    `--git-path hooks` (that FOLLOWS core.hooksPath, so this script would find
+#    itself and recurse), and NOT `--git-dir`/hooks (wrong dir inside a linked
+#    worktree) and NOT `--show-toplevel`/.git/hooks (wrong for worktrees,
+#    submodules and separate git dirs).
+#  * stdin is a single stream, so two hooks can't both read it. For the hooks
+#    that receive stdin it is buffered once and replayed to each. For the rest
+#    stdin is passed through untouched, because reading it in e.g. pre-commit
+#    would block when git leaves a terminal attached.
+#  * A non-zero exit stops the chain and is propagated, so a repo guard that
+#    refuses a commit actually refuses it.
+#  * A hook file that exists but isn't executable is reported, not skipped in
+#    silence — that is the classic "why didn't my hook run" hour.
+#
+# Escape hatch: GIT_CHAIN_HOOKS=0 skips everything. GIT_CHAIN_HOOKS_DEBUG=1
+# traces what runs.
+set -u
+unset CDPATH
+
+[ "${GIT_CHAIN_HOOKS:-1}" = "0" ] && exit 0
+
+HOOK_NAME="$(basename -- "$0")"
+CHAIN_DIR="$(cd -- "$(dirname -- "$0")" && pwd -P)"
+
+_dbg() { [ "${GIT_CHAIN_HOOKS_DEBUG:-0}" = "1" ] && printf 'chain-hook[%s]: %s\n' "$HOOK_NAME" "$*" >&2; return 0; }
+
+# Which hooks are handed data on stdin (githooks(5)).
+case "$HOOK_NAME" in
+	pre-push|pre-receive|post-receive|proc-receive|post-rewrite|reference-transaction)
+		STDIN_HOOK=1 ;;
+	*)	STDIN_HOOK=0 ;;
+esac
+
+STDIN_BUF=""
+if [ "$STDIN_HOOK" = "1" ]; then
+	STDIN_BUF="$(mktemp "${TMPDIR:-/tmp}/chain-hook.XXXXXX")" || exit 1
+	trap 'rm -f "$STDIN_BUF"' EXIT HUP INT TERM
+	cat > "$STDIN_BUF"
+	_dbg "buffered $(wc -c < "$STDIN_BUF" | tr -d ' ') bytes of stdin"
+fi
+
+# Absolute path of a file's directory + its name (one symlink level resolved).
+_canon() {
+	_cp_d="$(dirname -- "$1")"; _cp_b="$(basename -- "$1")"
+	_cp_d="$(cd -- "$_cp_d" 2>/dev/null && pwd -P)" || { printf '%s\n' "$1"; return; }
+	printf '%s/%s\n' "$_cp_d" "$_cp_b"
+}
+
+SELF="$(_canon "$0")"
+CHAIN_SCRIPT="$(_canon "$CHAIN_DIR/chain-hook")"
+
+_run() {
+	_h="$1"; shift
+	[ -e "$_h" ] || return 0
+	if [ ! -x "$_h" ]; then
+		printf '%s\n' "⚠️  git hook $HOOK_NAME: $_h exists but is not executable — skipped (chmod +x it)" >&2
+		return 0
+	fi
+	# Never re-enter this dispatcher (a repo hook symlinked back at it, or a
+	# repo-local core.hooksPath pointing here).
+	_hc="$(_canon "$_h")"
+	_ht="$(readlink "$_h" 2>/dev/null || true)"
+	[ -n "$_ht" ] && case "$_ht" in /*) _hc2="$(_canon "$_ht")" ;; *) _hc2="$(_canon "$(dirname -- "$_h")/$_ht")" ;; esac || _hc2=""
+	for _seen in "$SELF" "$CHAIN_SCRIPT"; do
+		if [ "$_hc" = "$_seen" ] || [ "${_hc2:-}" = "$_seen" ]; then
+			_dbg "skipping $_h (it is this dispatcher)"
+			return 0
+		fi
+	done
+	_dbg "running $_h $*"
+	if [ "$STDIN_HOOK" = "1" ]; then
+		"$_h" "$@" < "$STDIN_BUF"
+	else
+		"$_h" "$@"
+	fi
+}
+
+# 1. the global implementation
+_run "$CHAIN_DIR/global.d/$HOOK_NAME" "$@" || exit $?
+
+# 2. the repository's own hooks
+REPO_COMMON="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
+[ -n "$REPO_COMMON" ] || exit 0
+case "$REPO_COMMON" in /*) ;; *) REPO_COMMON="$(pwd)/$REPO_COMMON" ;; esac
+REPO_HOOKS="$REPO_COMMON/hooks"
+_dbg "repo hooks dir: $REPO_HOOKS"
+
+_run "$REPO_HOOKS/$HOOK_NAME" "$@" || exit $?
+
+if [ -d "$REPO_HOOKS/$HOOK_NAME.d" ]; then
+	for _entry in "$REPO_HOOKS/$HOOK_NAME.d"/*; do
+		[ -e "$_entry" ] || continue          # unmatched glob
+		case "$_entry" in *.sample|*~|*.bak) continue ;; esac
+		[ -d "$_entry" ] && continue
+		_run "$_entry" "$@" || exit $?
+	done
+fi
+
+exit 0

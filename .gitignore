@@ -1,0 +1,4 @@
+# install-chain.sh writes backups next to the target hooks dir, never here,
+# but keep stray local experiments out of the tree.
+*.bak-pre-chain-*
+*~
